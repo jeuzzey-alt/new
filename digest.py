@@ -44,10 +44,34 @@ EUTILS = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
 EPMC_URL = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
 
 # Поисковые запросы. При необходимости добавьте журналы или термины.
-PUBMED_QUERY = ("(psychiatry[MeSH Terms] OR psychotherapy[MeSH Terms] "
+PUBMED_TOPIC = ("(psychiatry[MeSH Terms] OR psychotherapy[MeSH Terms] "
                 "OR psychiatr*[tiab] OR psychotherap*[tiab])")
+# Только систематические обзоры, мета-анализы и РКИ. Свежие записи PubMed ещё не размечены
+# типом публикации, поэтому дополнительно ищем по заголовку/аннотации.
+PUBMED_DESIGN = ('(systematic review[pt] OR meta-analysis[pt] OR randomized controlled trial[pt] '
+                 'OR "systematic review"[ti] OR meta-analy*[ti] OR metaanaly*[ti] OR "umbrella review"[ti] '
+                 'OR random*[ti] OR "randomized controlled trial"[tiab] OR "randomised controlled trial"[tiab] '
+                 'OR "randomized clinical trial"[tiab] OR "randomised clinical trial"[tiab])')
+PUBMED_EXCLUDE = ('(protocol[ti] OR "scoping review"[ti] OR case reports[pt] '
+                  'OR "case report"[ti] OR "case series"[ti])')
+PUBMED_QUERY = f"{PUBMED_TOPIC} AND {PUBMED_DESIGN} NOT {PUBMED_EXCLUDE}"
+
 # Из Europe PMC берём только препринты (medRxiv, bioRxiv, PsyArXiv и др.): журналы уже дал PubMed
-EPMC_QUERY = "(TITLE_ABS:psychiatr* OR TITLE_ABS:psychotherap*) AND SRC:PPR"
+EPMC_QUERY = ('(TITLE_ABS:psychiatr* OR TITLE_ABS:psychotherap*) AND SRC:PPR AND '
+              '(TITLE:"systematic review" OR TITLE:"meta-analysis" OR TITLE:"meta-analyses" '
+              'OR TITLE:"umbrella review" OR TITLE:randomized OR TITLE:randomised '
+              'OR ABSTRACT:"randomized controlled trial" OR ABSTRACT:"randomised controlled trial" '
+              'OR ABSTRACT:"randomized clinical trial" OR ABSTRACT:"randomised clinical trial") '
+              'NOT (TITLE:protocol OR TITLE:"scoping review")')
+
+SR_RE = re.compile(r"systematic review|meta-?analy|umbrella review", re.I)
+
+
+def study_type(title, pub_types=()):
+    """'sr' — систематический обзор / мета-анализ, 'rct' — рандомизированное исследование."""
+    if any(p in ("Systematic Review", "Meta-Analysis") for p in pub_types) or SR_RE.search(title or ""):
+        return "sr"
+    return "rct"
 
 
 def get(url, params=None):
@@ -121,9 +145,12 @@ def parse_pubmed(art):
         pub_date = text_of(pd)
     doi = next((text_of(x) for x in art.findall("PubmedData/ArticleIdList/ArticleId")
                 if x.get("IdType") == "doi"), "")
-    return normalize("PubMed", title, authors, a.findtext("Journal/Title") or "",
+    item = normalize("PubMed", title, authors, a.findtext("Journal/Title") or "",
                      pub_date, doi, pmid, abstract,
                      f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else "")
+    pub_types = [text_of(p) for p in a.findall("PublicationTypeList/PublicationType")]
+    item["type"] = study_type(item["title"], pub_types)
+    return item
 
 
 def pubmed_items(days):
@@ -157,12 +184,26 @@ def europepmc_items(days):
         else:
             url = f"https://europepmc.org/article/{r.get('source')}/{r.get('id')}"
         authors = (r.get("authorString") or "").split(",")
-        out.append(normalize("Препринт", r.get("title", ""), authors,
-                             r.get("bookOrReportDetails", {}).get("publisher", "")
-                             or r.get("journalTitle", "") or "Препринт",
-                             r.get("firstPublicationDate", ""),
-                             doi, pmid, r.get("abstractText", ""), url))
+        item = normalize("Препринт", r.get("title", ""), authors,
+                         r.get("bookOrReportDetails", {}).get("publisher", "")
+                         or r.get("journalTitle", "") or "Препринт",
+                         r.get("firstPublicationDate", ""),
+                         doi, pmid, r.get("abstractText", ""), url)
+        item["type"] = study_type(item["title"])
+        out.append(item)
     return out
+
+
+SECTIONS = [
+    ("Систематические обзоры и мета-анализы", lambda it: it["source"] == "PubMed" and it["type"] == "sr"),
+    ("Рандомизированные контролируемые исследования", lambda it: it["source"] == "PubMed" and it["type"] == "rct"),
+    ("Препринты (без рецензирования)", lambda it: it["source"] != "PubMed"),
+]
+TYPE_LABEL = {"sr": "Обзор / мета-анализ", "rct": "РКИ"}
+
+
+def grouped(items):
+    return [(title, [it for it in items if match(it)]) for title, match in SECTIONS]
 
 
 # ---------- Дедупликация ----------
@@ -184,21 +225,30 @@ def is_seen(con, key):
 # ---------- Вывод и отправка ----------
 
 def render(items, day):
-    lines = [f"Новые публикации по психиатрии и психотерапии: {day}",
+    lines = [f"Психиатрия и психотерапия: систематические обзоры, мета-анализы и РКИ. {day}",
              f"Всего новых статей: {len(items)}", ""]
-    for n, it in enumerate(items, 1):
-        authors = ", ".join(it["authors"][:6]) + (" и др." if len(it["authors"]) > 6 else "")
-        lines += [
-            f"{n}. {it['title']}",
-            f"   Авторы: {authors or '—'}",
-            f"   Журнал: {it['journal'] or '—'} | Дата: {it['date'] or '—'} | Источник: {it['source']}",
-            f"   Ссылка: {it['url'] or '—'}",
-        ]
-        if it["doi"]:
-            lines.append(f"   DOI: {it['doi']}")
-        lines.append("   Аннотация:")
-        lines.append(textwrap.indent(it["abstract"] or "нет аннотации", "   "))
-        lines.append("")
+    n = 0
+    for section, group in grouped(items):
+        if not group:
+            continue
+        lines += [f"=== {section}: {len(group)} ===", ""]
+        for it in group:
+            n += 1
+            authors = ", ".join(it["authors"][:6]) + (" и др." if len(it["authors"]) > 6 else "")
+            kind = f" [{TYPE_LABEL[it['type']]}]" if it["source"] != "PubMed" else ""
+            lines += [
+                f"{n}. {it['title']}{kind}",
+                f"   Авторы: {authors or '—'}",
+                f"   Журнал: {it['journal'] or '—'} | Дата: {it['date'] or '—'}",
+                f"   Ссылка: {it['url'] or '—'}",
+            ]
+            if it["doi"]:
+                lines.append(f"   DOI: {it['doi']}")
+            lines.append("   Аннотация:")
+            lines.append(textwrap.indent(it["abstract"] or "нет аннотации", "   "))
+            lines.append("")
+    if not items:
+        lines.append("За этот период новых статей не найдено.")
     return "\n".join(lines)
 
 
@@ -208,7 +258,8 @@ def render_html(items, day, note=""):
 
     def block(n, it):
         authors = ", ".join(it["authors"][:6]) + (" и др." if len(it["authors"]) > 6 else "")
-        meta = " · ".join(filter(None, [authors, it["journal"], it["date"]]))
+        kind = TYPE_LABEL[it["type"]] if it["source"] != "PubMed" else ""
+        meta = " · ".join(filter(None, [kind, authors, it["journal"], it["date"]]))
         abstract = esc(it["abstract"]).replace("\n", "<br>") or "<i>Аннотация отсутствует</i>"
         return (f'<div style="margin:0 0 22px">'
                 f'<div style="font-size:16px;font-weight:bold">{n}. '
@@ -216,15 +267,14 @@ def render_html(items, day, note=""):
                 f'<div style="color:#666;font-size:13px;margin:3px 0 6px">{esc(meta)}</div>'
                 f'<div style="font-size:14px;line-height:1.45">{abstract}</div></div>')
 
-    journals = [it for it in items if it["source"] == "PubMed"]
-    preprints = [it for it in items if it["source"] != "PubMed"]
     parts = [f'<div style="font-family:Arial,sans-serif;max-width:780px;color:#222">',
              f'<h2 style="margin:0 0 4px">Психиатрия и психотерапия</h2>',
-             f'<div style="color:#666;margin-bottom:18px">{day} · новых статей: {len(items)}</div>']
+             f'<div style="color:#666;margin-bottom:18px">Систематические обзоры, мета-анализы и РКИ · '
+             f'{day} · новых статей: {len(items)}</div>']
     if note:
         parts.append(f'<div style="background:#fff4e5;padding:8px 12px;margin-bottom:16px">{esc(note)}</div>')
     n = 0
-    for title, group in (("Журнальные статьи (PubMed)", journals), ("Препринты", preprints)):
+    for title, group in grouped(items):
         if group:
             parts.append(f'<h3 style="border-bottom:1px solid #ddd;padding-bottom:4px">{title} — {len(group)}</h3>')
             for it in group:
@@ -303,7 +353,10 @@ def main():
               file=sys.stderr)
         return
 
-    send_email(f"Психиатрия и психотерапия: новых статей {len(fresh)} ({today})", body, html_body)
+    n_sr = sum(it["type"] == "sr" for it in fresh)
+    subject = (f"Психиатрия и психотерапия ({today}): обзоры и мета-анализы: {n_sr}, "
+               f"РКИ: {len(fresh) - n_sr}")
+    send_email(subject, body, html_body)
     con.executemany("INSERT OR IGNORE INTO seen (k, added) VALUES (?, ?)",
                     [(k, today) for it in fresh for k in keys_of(it)])
     con.commit()
